@@ -7,6 +7,7 @@ const instance = {
   name: "desktop",
   mode: "source-native",
   origin: "http://localhost:3000",
+  root: "/home/instances/desktop",
   source: { repo: "/source" },
 } as Instance;
 const options = {
@@ -55,6 +56,7 @@ test("leaves running services alone", async () => {
       engines: native(run, true),
       pending: async () => false,
       restore: async () => undefined,
+      restoreByok: async () => undefined,
     }),
   ).toMatchObject({ code: 0, details: { origin: instance.origin } });
   expect(run).not.toHaveBeenCalled();
@@ -69,6 +71,7 @@ test("brings the local models back while the services keep running", async () =>
       engines: native(run, true),
       pending: async () => false,
       restore,
+      restoreByok: async () => undefined,
     }),
   ).toMatchObject({ code: 0, state: "ready" });
   expect(restore).toHaveBeenCalledWith(
@@ -78,6 +81,48 @@ test("brings the local models back while the services keep running", async () =>
   expect(run).not.toHaveBeenCalled();
 });
 
+test("mounts a saved BYOK source again after the local models", async () => {
+  const order: string[] = [];
+  const restore = vi.fn(async () => {
+    order.push("restore");
+    return undefined;
+  });
+  const restoreByok = vi.fn(async () => {
+    order.push("byok");
+    return undefined;
+  });
+  expect(
+    await resumeSourceInstance(options, {
+      load: async () => instance,
+      engines: native(vi.fn(), true),
+      pending: async () => false,
+      restore,
+      restoreByok,
+    }),
+  ).toMatchObject({ code: 0, message: "Services are already running." });
+  expect(order).toEqual(["restore", "byok"]);
+  expect(restoreByok).toHaveBeenCalledWith(
+    "/home",
+    expect.objectContaining({ signal: options.signal }),
+  );
+});
+
+test("reports a BYOK gateway that did not come back on a ready resume", async () => {
+  const byokGateway = {
+    code: "BYOK_UNREACHABLE",
+    message: "Endpoint did not answer.",
+  };
+  expect(
+    await resumeSourceInstance(options, {
+      load: async () => instance,
+      engines: native(vi.fn(), true),
+      pending: async () => false,
+      restore: async () => undefined,
+      restoreByok: async () => byokGateway,
+    }),
+  ).toMatchObject({ code: 0, state: "ready", details: { byokGateway } });
+});
+
 test("reports a local model restore that failed", async () => {
   const failed = {
     code: 4,
@@ -85,18 +130,22 @@ test("reports a local model restore that failed", async () => {
     message: "The local model stack is not ready.",
     details: { code: "LOCAL_MODELS_RECOVERY_REQUIRED" },
   };
+  const restoreByok = vi.fn(async () => undefined);
   expect(
     await resumeSourceInstance(options, {
       load: async () => instance,
       engines: native(vi.fn(), true),
       pending: async () => false,
       restore: async () => failed,
+      restoreByok,
     }),
   ).toEqual(failed);
+  expect(restoreByok).not.toHaveBeenCalled();
 });
 
 test("leaves the local models to a full start", async () => {
   const restore = vi.fn(async () => undefined);
+  const restoreByok = vi.fn(async () => undefined);
   await resumeSourceInstance(options, {
     load: async () => instance,
     engines: native(
@@ -108,8 +157,10 @@ test("leaves the local models to a full start", async () => {
       false,
     ),
     restore,
+    restoreByok,
   });
   expect(restore).not.toHaveBeenCalled();
+  expect(restoreByok).not.toHaveBeenCalled();
 });
 
 test("restarts running services for a changed user.env", async () => {
@@ -151,6 +202,7 @@ test("reports the source the services serve from", async () => {
       engines: native(vi.fn(), true),
       pending: async () => false,
       restore: async () => undefined,
+      restoreByok: async () => undefined,
     }),
   ).toMatchObject({ code: 0, details: { source: "/source" } });
   // The instance names a new checkout only once its services became ready

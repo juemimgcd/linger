@@ -302,7 +302,9 @@ Gateway and runs Agents. The daemon exits with the app.
   hash), and `LocalServer` resume emits `local_server.resume_started`,
   `local_server.resume_stage` (`stage`, `ms`), `local_server.resume_succeeded`
   (`total_ms`), and `local_server.resume_failed` (`stage`, `total_ms`,
-  redacted `error` bounded to 500 chars with query/hash stripped).
+  redacted `error` bounded to 500 chars with query/hash stripped). A resume
+  whose saved BYOK gateway did not come back still succeeds and logs
+  `local_server.byok_gateway_unavailable` (`code`, `message`).
 - `src/shell/*.html`: app-owned pages (title bar, offline/setup page). They
   have no network access and talk to the main process via `src/preload/shell.ts`.
 - `src/preload/index.ts`: the only SPA API, `window.lingerDesktop`. Its
@@ -403,7 +405,8 @@ home> --stop-local-models` under `ELECTRON_RUN_AS_NODE`, detached, with
   installation. The Computer exits with the app, so nothing uses the models
   until the next launch, whose resume applies the approved plan again even
   though the services still run, unless the person switched the Computer's
-  model source to a subscription or BYOK. A
+  model source to a subscription; a BYOK source gets its gateway mounted
+  again instead. A
   quit for an update or a relaunch, and the `--quit` of setup or the
   uninstaller (which stop the models themselves right after), leave them.
 - `src/main/legacy-migration.ts`: on start, stops a bridge an older version

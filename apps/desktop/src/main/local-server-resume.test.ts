@@ -131,6 +131,27 @@ describe("LocalServerModule resume coordination", () => {
     await f.host.stop("quit");
   });
 
+  it("logs a BYOK gateway that did not come back and still resumes", async () => {
+    const f = setupResumeFixture(`
+      process.stdout.write(JSON.stringify({ code: 0, details: { origin: "http://localhost:3000", byokGateway: { code: "BYOK_UNREACHABLE", message: "Endpoint did not answer." } } }) + "\\n");
+    `);
+
+    await f.host.start();
+
+    await vi.waitFor(() => expect(f.module.status().phase).toBe("ready"));
+    expect(f.showStartFailed).not.toHaveBeenCalled();
+    expect(
+      f.logs.find(
+        (entry) => entry.event === "local_server.byok_gateway_unavailable",
+      ),
+    ).toEqual({
+      level: "warn",
+      event: "local_server.byok_gateway_unavailable",
+      fields: { code: "BYOK_UNREACHABLE", message: "Endpoint did not answer." },
+    });
+    await f.host.stop("quit");
+  });
+
   it("redacts query, hash, and secrets and bounds resume_failed errors to 500 chars", async () => {
     const longPadding = "x".repeat(600);
     const f = setupResumeFixture(`

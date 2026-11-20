@@ -52,7 +52,8 @@ import {
 } from "./teamhub-binaries.js";
 import { prepareRuntime } from "./managed-runtimes.js";
 import { applyNativeSource, prepareByokRuntime } from "./byok-source.js";
-import { prepareLocalModels } from "./local-models.js";
+import { atomicPrivate, privateDirectory } from "./instance.js";
+import { prepareLocalModels, restoreByokSource } from "./local-models.js";
 import {
   inspectNativeListeners,
   inspectNativeProcess,
@@ -89,6 +90,7 @@ vi.mock("./byok-source.js", async (original) => ({
 vi.mock("./local-models.js", async (original) => ({
   ...(await original<typeof import("./local-models.js")>()),
   prepareLocalModels: vi.fn(async () => undefined),
+  restoreByokSource: vi.fn(async () => undefined),
 }));
 vi.mock("./managed-runtimes.js", () => ({
   runtimeVersionFailure: vi.fn(() => undefined),
@@ -320,6 +322,159 @@ test("a restart of local models keeps the model source the person switched to", 
   expect(result.code).toBe(0);
   expect(vi.mocked(prepareLocalModels).mock.calls).toHaveLength(2);
   expect(applyNativeSource).not.toHaveBeenCalled();
+});
+
+async function saveModelSource(home: string, mode: string, runtime: string) {
+  const state = path.join(home, "runtime", "localmodels", "state");
+  await privateDirectory(state);
+  await atomicPrivate(
+    path.join(state, "model-source.json"),
+    JSON.stringify({
+      schema: "localmodels.model-source/v1",
+      mode,
+      runtime,
+      runtime_model: "model",
+      model_label: null,
+      gateway_url: "http://127.0.0.1:18480",
+      environment: {},
+    }),
+  );
+}
+
+async function restartAfter(
+  setupChoice: "codex" | "local-models",
+  source: { mode: string; runtime: string },
+  restartRuntime?: Awaited<ReturnType<typeof prepareRuntime>>,
+) {
+  const f = await fixture();
+  vi.mocked(prepareRuntime).mockResolvedValue({
+    code: 0,
+    state: "ready",
+    message: "ok",
+  });
+  await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-flow",
+    setupChoice,
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  await saveModelSource(f.home, source.mode, source.runtime);
+  vi.mocked(applyNativeSource).mockClear();
+  vi.mocked(prepareLocalModels).mockClear();
+  vi.mocked(prepareRuntime).mockClear();
+  vi.mocked(prepareModelGateway).mockClear();
+  vi.mocked(restoreByokSource).mockClear();
+  if (restartRuntime)
+    vi.mocked(prepareRuntime).mockResolvedValue(restartRuntime);
+  const result = await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-flow",
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  return { f, result };
+}
+
+test.each(["codex", "local-models"] as const)(
+  "a restart mounts a BYOK source switched to after choosing %s",
+  async (setupChoice) => {
+    // BYOK needs no runtime sign-in, so a pending one never holds a resume.
+    const { f, result } = await restartAfter(
+      setupChoice,
+      { mode: "byok", runtime: "pi" },
+      {
+        code: 4,
+        state: "action_required",
+        message: "sign in later",
+        details: { code: "RUNTIME_AUTH_REQUIRED" },
+      },
+    );
+    expect(result.code).toBe(0);
+    expect(vi.mocked(prepareRuntime).mock.calls[0]?.[0]).toBe("pi");
+    expect(restoreByokSource).toHaveBeenCalledWith(
+      path.resolve(f.home),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(applyNativeSource).not.toHaveBeenCalled();
+    expect(prepareLocalModels).not.toHaveBeenCalled();
+    expect(prepareModelGateway).toHaveBeenCalledWith(
+      expect.anything(),
+      { runtime: "pi", modelSource: "byok" },
+      expect.anything(),
+    );
+  },
+);
+
+test("a restart reports a BYOK gateway that did not come back", async () => {
+  const byokGateway = {
+    code: "BYOK_UNREACHABLE",
+    message: "Endpoint did not answer.",
+  };
+  vi.mocked(restoreByokSource).mockResolvedValue(byokGateway);
+  const { result } = await restartAfter("codex", {
+    mode: "byok",
+    runtime: "pi",
+  });
+  expect(result).toMatchObject({ code: 0, details: { byokGateway } });
+});
+
+test("choosing a subscription again replaces a saved BYOK source", async () => {
+  const f = await fixture();
+  vi.mocked(prepareRuntime).mockResolvedValue({
+    code: 0,
+    state: "ready",
+    message: "ok",
+  });
+  await saveModelSource(f.home, "byok", "pi");
+  await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-flow",
+    setupChoice: "codex",
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  expect(applyNativeSource).toHaveBeenCalledWith(
+    path.resolve(f.home),
+    "subscription",
+    "codex",
+    expect.any(AbortSignal),
+  );
+  expect(restoreByokSource).not.toHaveBeenCalled();
+});
+
+test("a restart keeps a saved subscription source as before", async () => {
+  const { result } = await restartAfter("codex", {
+    mode: "subscription",
+    runtime: "codex",
+  });
+  expect(result.code).toBe(0);
+  expect(applyNativeSource).toHaveBeenCalledWith(
+    expect.any(String),
+    "subscription",
+    "codex",
+    expect.any(AbortSignal),
+  );
+  expect(restoreByokSource).not.toHaveBeenCalled();
+  expect(prepareModelGateway).toHaveBeenCalledWith(
+    expect.anything(),
+    "codex",
+    expect.anything(),
+  );
+});
+
+test("a restart keeps a saved local source as before", async () => {
+  const { result } = await restartAfter("local-models", {
+    mode: "local",
+    runtime: "pi",
+  });
+  expect(result.code).toBe(0);
+  expect(prepareLocalModels).toHaveBeenCalled();
+  expect(applyNativeSource).not.toHaveBeenCalled();
+  expect(restoreByokSource).not.toHaveBeenCalled();
 });
 
 test("only TeamHub's process gets the server identity key", async () => {

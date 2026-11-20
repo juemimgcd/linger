@@ -11,6 +11,7 @@ import {
   validateByokConfiguration,
 } from "./byok-source.js";
 import { atomicPrivate, privateDirectory } from "./instance.js";
+import { restoreByokSource, withLocalModelsLock } from "./local-models.js";
 
 const tempDirs: string[] = [];
 
@@ -211,6 +212,257 @@ describe("BYOK localmodels integration", () => {
       runtime: "pi",
       runtimeModel: "localmodels-byok",
       environment: { PI_CODING_AGENT_DIR: "/abs/pi" },
+      gatewayUrl: "http://127.0.0.1:18480",
     });
+  });
+});
+
+async function writeSource(home: string, source: unknown): Promise<void> {
+  const state = path.join(home, "runtime", "localmodels", "state");
+  await privateDirectory(state);
+  await atomicPrivate(
+    path.join(state, "model-source.json"),
+    typeof source === "string" ? source : JSON.stringify(source),
+  );
+}
+
+function byokSource(gatewayUrl: string | null = "http://127.0.0.1:18480") {
+  return {
+    schema: "localmodels.model-source/v1",
+    mode: "byok",
+    runtime: "pi",
+    runtime_model: "localmodels-byok",
+    model_label: "vendor/model",
+    gateway_url: gatewayUrl,
+    environment: {},
+  };
+}
+
+describe("restoreByokSource", () => {
+  const ok = async () => ({ code: 0, stdout: "{}", stderr: "" });
+
+  it("mounts the saved BYOK source from its saved configuration when the gateway is down", async () => {
+    const home = await makeHome();
+    await writeSource(home, byokSource());
+    const localmodels = vi.fn(ok);
+    const fetch = vi.fn(async () => {
+      throw new Error("connect ECONNREFUSED");
+    });
+    await restoreByokSource(
+      home,
+      { signal: new AbortController().signal, onEvent: () => {} },
+      { localmodels, fetch },
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:18480/health",
+      expect.objectContaining({ redirect: "error" }),
+    );
+    expect(localmodels).toHaveBeenCalledTimes(1);
+    const [, args, options] = localmodels.mock.calls[0] as unknown as [
+      string,
+      string[],
+      Record<string, unknown>,
+    ];
+    expect(args.slice(0, 6)).toEqual([
+      "source",
+      "apply",
+      "--mode",
+      "byok",
+      "--runtime",
+      "pi",
+    ]);
+    expect(args.at(-1)).toBe("--json");
+    expect(args).not.toContain("--config-stdin");
+    expect(options).not.toHaveProperty("input");
+  });
+
+  it("leaves a gateway that already answers alone", async () => {
+    const home = await makeHome();
+    await writeSource(home, byokSource());
+    const localmodels = vi.fn(ok);
+    const fetch = vi.fn(async () => new Response("ok", { status: 200 }));
+    await restoreByokSource(
+      home,
+      { signal: new AbortController().signal, onEvent: () => {} },
+      { localmodels, fetch },
+    );
+    expect(localmodels).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["local", { ...byokSource(), mode: "local" }],
+    ["subscription", { ...byokSource(), mode: "subscription" }],
+    ["malformed", "{not json"],
+    ["missing", undefined],
+  ])("does nothing for a %s source", async (_name, source) => {
+    const home = await makeHome();
+    if (source !== undefined) await writeSource(home, source);
+    const localmodels = vi.fn(ok);
+    const fetch = vi.fn(async () => new Response("ok"));
+    await restoreByokSource(
+      home,
+      { signal: new AbortController().signal, onEvent: () => {} },
+      { localmodels, fetch },
+    );
+    expect(localmodels).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://10.0.0.5:18480",
+    "https://127.0.0.1:18480",
+    "http://127.0.0.1",
+    "http://user:pw@127.0.0.1:18480",
+    "http://127.0.0.1:18480/?x=1",
+    "not a url",
+    null,
+  ])("never probes the gateway URL %s and applies", async (gatewayUrl) => {
+    const home = await makeHome();
+    await writeSource(home, byokSource(gatewayUrl));
+    const localmodels = vi.fn(ok);
+    const fetch = vi.fn(async () => new Response("ok"));
+    await restoreByokSource(
+      home,
+      { signal: new AbortController().signal, onEvent: () => {} },
+      { localmodels, fetch },
+    );
+    expect(fetch).not.toHaveBeenCalled();
+    expect(localmodels).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs and returns a failed mount without throwing", async () => {
+    const home = await makeHome();
+    await writeSource(home, byokSource(null));
+    const events: { kind: string; message: string }[] = [];
+    const failure = await restoreByokSource(
+      home,
+      {
+        signal: new AbortController().signal,
+        onEvent: (event) => events.push(event),
+      },
+      {
+        localmodels: vi.fn(async () => ({
+          code: 1,
+          stdout: JSON.stringify({
+            code: "BYOK_UNREACHABLE",
+            message: "Endpoint did not answer.",
+          }),
+          stderr: "",
+        })),
+      },
+    );
+    expect(failure).toEqual({
+      code: "BYOK_UNREACHABLE",
+      message: "Endpoint did not answer.",
+    });
+    const log = events.find((event) => event.kind === "log");
+    expect(log?.message).toContain("Endpoint did not answer.");
+    expect(log?.message).toContain("BYOK_UNREACHABLE");
+
+    events.length = 0;
+    expect(
+      await restoreByokSource(
+        home,
+        {
+          signal: new AbortController().signal,
+          onEvent: (event) => events.push(event),
+        },
+        {
+          localmodels: vi.fn(async () => ({
+            code: 1,
+            stdout: "raw private tool output",
+            stderr: "",
+          })),
+        },
+      ),
+    ).toMatchObject({ code: "BYOK_GATEWAY_FAILED" });
+    expect(JSON.stringify(events)).not.toContain("raw private tool output");
+    expect(events.some((event) => event.kind === "log")).toBe(true);
+  });
+
+  it("keeps the cause of a tool that could not run", async () => {
+    const home = await makeHome();
+    await writeSource(home, byokSource(null));
+    expect(
+      await restoreByokSource(
+        home,
+        { signal: new AbortController().signal, onEvent: () => {} },
+        {
+          localmodels: vi.fn(async () => {
+            throw new Error("The installed localmodels tool kit is missing.");
+          }),
+        },
+      ),
+    ).toEqual({
+      code: "BYOK_GATEWAY_FAILED",
+      message: "The installed localmodels tool kit is missing.",
+    });
+  });
+
+  it("waits for a quit-time stop holding the lock, then mounts", async () => {
+    const home = await makeHome();
+    await writeSource(home, byokSource(null));
+    const localmodels = vi.fn(ok);
+    let release!: () => void;
+    let held!: () => void;
+    const holding = new Promise<void>((resolve) => (held = resolve));
+    const stop = withLocalModelsLock(home, async () => {
+      held();
+      await new Promise<void>((resolve) => (release = resolve));
+    });
+    await holding;
+    const restored = restoreByokSource(
+      home,
+      { signal: new AbortController().signal, onEvent: () => {} },
+      { localmodels, lockRetryMs: 5, lockWaitMs: 10_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(localmodels).not.toHaveBeenCalled();
+    release();
+    await stop;
+    expect(await restored).toBeUndefined();
+    expect(localmodels).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up on a lock that is never released without applying", async () => {
+    const home = await makeHome();
+    await writeSource(home, byokSource(null));
+    const localmodels = vi.fn(ok);
+    let release!: () => void;
+    let held!: () => void;
+    const holding = new Promise<void>((resolve) => (held = resolve));
+    const stop = withLocalModelsLock(home, async () => {
+      held();
+      await new Promise<void>((resolve) => (release = resolve));
+    });
+    await holding;
+    expect(
+      await restoreByokSource(
+        home,
+        { signal: new AbortController().signal, onEvent: () => {} },
+        { localmodels, lockRetryMs: 5, lockWaitMs: 30 },
+      ),
+    ).toMatchObject({ code: "LOCAL_MODELS_BUSY" });
+    expect(localmodels).not.toHaveBeenCalled();
+    release();
+    await stop;
+  });
+
+  it("lets a cancel through", async () => {
+    const home = await makeHome();
+    await writeSource(home, byokSource(null));
+    const controller = new AbortController();
+    await expect(
+      restoreByokSource(
+        home,
+        { signal: controller.signal, onEvent: () => {} },
+        {
+          localmodels: vi.fn(async () => {
+            controller.abort();
+            throw new Error("aborted");
+          }),
+        },
+      ),
+    ).rejects.toThrow();
   });
 });

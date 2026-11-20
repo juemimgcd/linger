@@ -2,7 +2,10 @@ import { realpath } from "node:fs/promises";
 import path from "node:path";
 
 import { loadInstance } from "@linger/local-installation/instance";
-import { restoreLocalModels } from "@linger/local-installation/local-models";
+import {
+  restoreByokSource,
+  restoreLocalModels,
+} from "@linger/local-installation/local-models";
 import { userEnvironmentPending } from "@linger/local-installation/user-environment";
 import type { InstallOutcome } from "@linger/local-installation/events";
 import {
@@ -51,6 +54,7 @@ export async function resumeSourceInstance(
     engines = ENGINES,
     pending = userEnvironmentPending,
     restore = restoreLocalModels,
+    restoreByok = restoreByokSource,
   } = {},
 ): Promise<InstallOutcome> {
   const instance = await load({
@@ -78,20 +82,35 @@ export async function resumeSourceInstance(
     ) &&
     !(await pending(instance))
   ) {
-    // A quit stops the local models but leaves the services running, so
-    // they come back here rather than with the services.
+    // A quit stops the local models and the Bifrost gateway a BYOK source
+    // runs on, but leaves the services running, so they come back here
+    // rather than with the services.
+    const onEvent = (event: { message?: string }) => {
+      if (event.message) options.log(event.message);
+    };
     const restored = await restore(instance, {
       signal: options.signal,
-      onEvent: (event) => {
-        if (event.message) options.log(event.message);
-      },
+      onEvent,
     });
     if (restored) return restored;
+    // A gateway that did not come back is reported, not a failed resume:
+    // the person can still reach the Models page.
+    const byokGateway = await restoreByok(
+      path.resolve(instance.root, "../.."),
+      {
+        signal: options.signal,
+        onEvent,
+      },
+    );
     return {
       code: 0,
       state: "ready",
       message: "Services are already running.",
-      details: { origin: instance.origin, source: instance.source.repo },
+      details: {
+        origin: instance.origin,
+        source: instance.source.repo,
+        ...(byokGateway ? { byokGateway } : {}),
+      },
     };
   }
   const outcome = await engine.run({

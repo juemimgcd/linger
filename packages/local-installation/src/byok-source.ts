@@ -268,6 +268,40 @@ function sourceApplyFailure(
   };
 }
 
+/**
+ * Installs the runtime a BYOK source drives. BYOK needs no runtime sign-in,
+ * so a pending one is not a failure. Returns the outcome only on failure.
+ */
+export async function prepareByokNativeRuntime(
+  runtime: NativeRuntime,
+  options: {
+    home: string;
+    signal: AbortSignal;
+    onEvent: (event: InstallerEvent) => void;
+    env?: NodeJS.ProcessEnv;
+  },
+  dependencies: {
+    localmodels?: typeof runLocalmodels;
+    prepareNative?: typeof prepareRuntime;
+  } = {},
+): Promise<InstallOutcome | undefined> {
+  const outcome = await (dependencies.prepareNative ?? prepareRuntime)(
+    runtime,
+    {
+      home: options.home,
+      signal: options.signal,
+      onEvent: options.onEvent,
+      env: options.env,
+    },
+    dependencies.localmodels ? { localmodels: dependencies.localmodels } : {},
+  );
+  return outcome.code === 0 ||
+    (outcome.details as { code?: string } | undefined)?.code ===
+      "RUNTIME_AUTH_REQUIRED"
+    ? undefined
+    : outcome;
+}
+
 export async function prepareByokRuntime(
   config: ByokConfiguration,
   options: {
@@ -283,22 +317,12 @@ export async function prepareByokRuntime(
 ): Promise<InstallOutcome> {
   const validated = validateByokConfiguration(config);
   const runtime = validated.runtime ?? "claude";
-  const nativeOutcome = await (dependencies.prepareNative ?? prepareRuntime)(
+  const nativeFailure = await prepareByokNativeRuntime(
     runtime,
-    {
-      home: options.home,
-      signal: options.signal,
-      onEvent: options.onEvent,
-      env: options.env,
-    },
-    dependencies.localmodels ? { localmodels: dependencies.localmodels } : {},
+    options,
+    dependencies,
   );
-  if (
-    nativeOutcome.code !== 0 &&
-    (nativeOutcome.details as { code?: string } | undefined)?.code !==
-      "RUNTIME_AUTH_REQUIRED"
-  )
-    return nativeOutcome;
+  if (nativeFailure) return nativeFailure;
 
   options.onEvent({
     kind: "stage",
@@ -370,6 +394,7 @@ export async function readByokEnvironment(home: string): Promise<
       runtime: NativeRuntime;
       runtimeModel: string;
       environment: Record<string, string>;
+      gatewayUrl: string | undefined;
     }
   | undefined
 > {
@@ -405,8 +430,129 @@ export async function readByokEnvironment(home: string): Promise<
       runtimeModel:
         typeof parsed.runtime_model === "string" ? parsed.runtime_model : "",
       environment,
+      gatewayUrl: loopbackGatewayUrl(parsed.gateway_url),
     };
   } catch {
     return undefined;
   }
+}
+
+// Only a loopback gateway is probed, so a tampered state file cannot point
+// the resume's health check at another host.
+function loopbackGatewayUrl(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  try {
+    const url = new URL(raw);
+    if (
+      url.protocol !== "http:" ||
+      (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") ||
+      !url.port ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    )
+      return undefined;
+    return url.origin + url.pathname.replace(/\/+$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
+async function gatewayAnswers(
+  gatewayUrl: string,
+  signal: AbortSignal,
+  fetchImpl: typeof fetch,
+): Promise<boolean> {
+  try {
+    const response = await fetchImpl(`${gatewayUrl}/health`, {
+      signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
+      redirect: "error",
+    });
+    return response.status === 200;
+  } catch {
+    return false;
+  }
+}
+
+/** Why a saved BYOK source's gateway could not be mounted again. */
+export interface ByokGatewayFailure {
+  code: string;
+  message: string;
+}
+
+/**
+ * Mounts a saved BYOK source on Bifrost again from the configuration
+ * localmodels saved, so the key never passes through Node, unless its
+ * loopback gateway already answers. The caller holds the local model lock,
+ * so a quit-time stop cannot take the gateway down between the check and
+ * the decision. Returns why it failed, without throwing, except for the
+ * caller's abort.
+ */
+export async function mountSavedByokSource(
+  home: string,
+  source: { runtime: NativeRuntime; gatewayUrl: string | undefined },
+  options: { signal: AbortSignal; onEvent: (event: InstallerEvent) => void },
+  dependencies: {
+    localmodels?: typeof runLocalmodels;
+    fetch?: typeof fetch;
+  } = {},
+): Promise<ByokGatewayFailure | undefined> {
+  if (
+    source.gatewayUrl &&
+    (await gatewayAnswers(
+      source.gatewayUrl,
+      options.signal,
+      dependencies.fetch ?? fetch,
+    ))
+  )
+    return undefined;
+  options.signal.throwIfAborted();
+  options.onEvent({
+    kind: "stage",
+    stage: "runtime",
+    state: "running",
+    message: "Mounting the saved BYOK endpoint on the local Bifrost gateway…",
+  });
+  const fallback = "The BYOK gateway did not start.";
+  let failure: InstallOutcome | undefined;
+  try {
+    // The kit's apply probes the endpoint once (up to about 35 s) before
+    // Bifrost starts.
+    const result = await applySource(
+      home,
+      "byok",
+      source.runtime,
+      { signal: options.signal, timeoutMs: 90_000 },
+      dependencies.localmodels ?? runLocalmodels,
+    );
+    if (result.code !== 0)
+      failure = sourceApplyFailure(
+        result.stdout,
+        fallback,
+        "BYOK_GATEWAY_FAILED",
+      );
+  } catch (error) {
+    options.signal.throwIfAborted();
+    failure = sourceApplyFailure(
+      "",
+      error instanceof Error && error.message ? error.message : fallback,
+      "BYOK_GATEWAY_FAILED",
+    );
+  }
+  if (!failure) {
+    options.onEvent({
+      kind: "stage",
+      stage: "runtime",
+      state: "succeeded",
+      message: "BYOK gateway is ready.",
+    });
+    return undefined;
+  }
+  return {
+    code:
+      (failure.details as { code?: string } | undefined)?.code ??
+      "BYOK_GATEWAY_FAILED",
+    message: failure.message,
+  };
 }

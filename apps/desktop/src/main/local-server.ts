@@ -2590,6 +2590,22 @@ export class LocalServerModule implements Module {
           .join(" "),
       );
     }
+    // The services run without the BYOK gateway; the person switches or
+    // fixes the source on the Models page, so this only leaves a trace.
+    const byokGateway = outcome.details?.byokGateway as
+      | { code?: unknown; message?: unknown }
+      | null
+      | undefined;
+    if (
+      byokGateway &&
+      typeof byokGateway === "object" &&
+      typeof byokGateway.code === "string"
+    )
+      this.#ctx?.log.warn("local_server.byok_gateway_unavailable", {
+        code: byokGateway.code,
+        message:
+          typeof byokGateway.message === "string" ? byokGateway.message : "",
+      });
     this.#adoptRuntime(outcome.runtime);
     const { source, origin } = outcome.details ?? {};
     return {
@@ -2722,6 +2738,8 @@ interface ResumeOutcome {
     origin?: unknown;
     code?: unknown;
     reasons?: unknown;
+    // Why a saved BYOK source's gateway did not come back: `{ code, message }`.
+    byokGateway?: unknown;
   };
   runtime?: InstanceRuntime;
 }

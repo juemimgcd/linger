@@ -53,7 +53,11 @@ whose Computer still uses the local model source (`model-source.json` says
 `local` or does not exist yet) has its stack checked once
 (`restoreLocalModels`), since a quit stops the models but not the services: a
 stack that is not ready gets the same restore, then becomes the model source
-again. A source switched to a subscription or BYOK leaves the stack stopped.
+again. A source switched to a subscription or BYOK leaves the stack stopped;
+a saved BYOK source gets its Bifrost gateway mounted again from the saved
+configuration unless it already answers (`restoreByokSource`), and a failure
+is logged and reported in the ready outcome's `details.byokGateway`
+without failing the resume.
 A failed installation records the stage that caused it, even when native
 checkout preparation and runtime setup ran in parallel. A BYOK mount failure
 belongs to runtime and keeps the redacted provider error in the job.
