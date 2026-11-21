@@ -1,0 +1,139 @@
+name: Windows BYOK recovery
+on:
+  push:
+    branches: [ci/windows-byok-427-trf8q0]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          go: false
+      - name: Bundle the installer and its production restore entry
+        run: |
+          pnpm --filter @linger/linger-installer build
+          pnpm --filter @linger/linger-installer exec esbuild ../../packages/local-installation/src/local-models.ts --bundle --platform=node --format=esm --target=node26 --outfile=dist/local-models.mjs
+          cmp packages/local-installation/src/restore-byok.py apps/linger-installer/dist/restore-byok.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer
+          path: apps/linger-installer/dist
+          retention-days: 3
+  recovery:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          architecture: x64
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: installer
+          path: ci-installer
+      - name: Exercise the Windows BYOK startup sequence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'byok427'
+          New-Item -Type Directory $root | Out-Null
+          $env:LINGER_HOME = Join-Path $root 'home'
+          $env:LOCALMODELS_STATE = Join-Path $env:LINGER_HOME 'runtime/localmodels/state'
+          $env:LOCALMODELS_TOOLS_DIR = Join-Path $root 'tools'
+          $env:LOCALMODELS_BIFROST_DIR = Join-Path $root 'bifrost'
+          $env:LOCALMODELS_BIFROST_ADDR = '127.0.0.1:18480'
+          $env:PYTHONDONTWRITEBYTECODE = '1'
+          $env:SIMPLEX_REGION = 'global'
+          $env:PYTHONNOUSERSITE = '1'
+          $current = (Get-Content apps/desktop/distribution/win32-x64.json -Raw | ConvertFrom-Json).localmodelsTool
+          $env:LINGER_LOCALMODELS_TOOL_JSON = $current | ConvertTo-Json -Compress
+          function Get-PinnedArchive($url, $sha, $name) {
+            $archive = Join-Path $root "$name.tgz"
+            curl.exe --retry 3 --fail --silent --show-error --location $url --output $archive
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $sha) { throw "Invalid digest for $name" }
+            $dir = Join-Path $root $name
+            New-Item -ItemType Directory $dir | Out-Null
+            tar.exe -xf $archive -C $dir
+            return (Join-Path $dir 'package')
+          }
+          $oldKit = Get-PinnedArchive 'https://registry.npmjs.org/@simplexai/localmodels-win32-x64/-/localmodels-win32-x64-0.1.0-dev.43.tgz' 'c65392558959e48fe6cd010a56b49345e6b8ed1213cd2fbbb5066e55278975fc' 'old-kit'
+          $kit = Get-PinnedArchive $current.mirrors[0] $current.sha256 'current-kit'
+          $pins = Get-Content (Join-Path $kit 'modules/localmodels/tools.json') -Raw | ConvertFrom-Json
+          $win = $pins.bifrost.builds | Where-Object { $_.platform -eq 'win32' -and $_.arch -eq 'x64' }
+          $bin = Get-PinnedArchive $win.url $win.npm.sha256 'gateway-kit'
+          $toolsDir = Join-Path $env:LOCALMODELS_TOOLS_DIR "bifrost-$($pins.bifrost.version)"
+          New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+          Copy-Item (Join-Path $bin 'bifrost-http') (Join-Path $toolsDir 'bifrost-http.exe')
+          $pi = Get-PinnedArchive $pins.pi.url $pins.pi.sha256 'pi'
+          $oldPy = Join-Path $oldKit 'python/python.exe'
+          $py = Join-Path $kit 'python/python.exe'
+          function Start-Endpoint {
+            $p = Start-Process -PassThru -FilePath $py -ArgumentList '-P -s -m localmodels.debug_stub_server --bind 127.0.0.1 --port 18090 --model stub-model'
+            for ($i=0; $i -lt 40; $i++) {
+              try { (Invoke-RestMethod 'http://127.0.0.1:18090/v1/models' -TimeoutSec 2).data | Out-Null; return $p } catch { if ($p.HasExited) { throw "Upstream exited: $($p.ExitCode)" }; Start-Sleep -Milliseconds 250 }
+            }
+            throw 'Upstream did not start'
+          }
+          function Is-Listening([int]$port) {
+            $client = [Net.Sockets.TcpClient]::new()
+            try { $client.Connect('127.0.0.1',$port); return $true } catch { return $false } finally { $client.Dispose() }
+          }
+          function Restore-Gateway {
+            node --input-type=module -e 'import {restoreByokSource} from "./ci-installer/local-models.mjs"; const result = await restoreByokSource(process.env.LINGER_HOME, {signal:AbortSignal.timeout(120000),onEvent: e => console.log(e.message)}); if (result) throw new Error(JSON.stringify(result));'
+            $health = Invoke-RestMethod 'http://127.0.0.1:18480/health' -TimeoutSec 5
+            if ($health.status -ne 'ok') { throw 'Gateway health failed' }
+          }
+          Write-Output "Windows $([Environment]::OSVersion.VersionString), runner $env:RUNNER_ARCH, Node $(node -p 'process.arch')"
+          if ((Is-Listening 18090) -or (Is-Listening 18480)) { throw 'Scenario ports already in use' }
+          $env:PYTHONPATH = Join-Path $kit 'modules'
+          $upstream = Start-Endpoint
+          try {
+            $env:PYTHONPATH = Join-Path $oldKit 'modules'
+            '{"baseUrl":"http://127.0.0.1:18090","modelId":"stub-model"}' | & $oldPy -P -s -m localmodels source apply --mode byok --runtime pi --base-dir (Join-Path $root 'models') --config-stdin --json
+            & $oldPy -P -s -m localmodels stack down --json
+            $upstream.Kill(); $upstream.WaitForExit()
+            if ((Is-Listening 18090) -or (Is-Listening 18480)) { throw 'Both ports must be offline' }
+            $creds = Join-Path $env:LOCALMODELS_STATE 'byok.json'
+            if ((Get-Content $creds -Raw | ConvertFrom-Json).schema -ne 'localmodels.byok-credentials/v1') { throw 'Expected 0.1.5 saved configuration' }
+            $env:PYTHONPATH = Join-Path $kit 'modules'
+            Restore-Gateway
+            if ((Is-Listening 18090) -or (Get-Content $creds -Raw | ConvertFrom-Json).schema -ne 'localmodels.byok-credentials/v2') { throw 'Offline upgrade failed' }
+            $before = (Get-NetTCPConnection -LocalPort 18480 -State Listen).OwningProcess
+            Write-Output "Offline upgrade from v1 to v2 passed. Gateway PID $before."
+            $profilePath = Join-Path $env:LOCALMODELS_STATE 'byok-home/.pi/agent'
+            $models = Join-Path $profilePath 'models.json'
+            $settings = Join-Path $profilePath 'settings.json'
+            $modelHash = (Get-FileHash $models).Hash
+            $settingsHash = (Get-FileHash $settings).Hash
+            Move-Item $models (Join-Path $root 'saved-models.json')
+            Move-Item $settings (Join-Path $root 'saved-settings.json')
+            Restore-Gateway
+            if ((Get-FileHash $models).Hash -ne $modelHash -or (Get-FileHash $settings).Hash -ne $settingsHash) { throw 'Pi profile restoration failed' }
+            $upstream = Start-Endpoint
+            $env:PI_CODING_AGENT_DIR = $profilePath
+            $reply = & node (Join-Path $pi $pins.pi.entry) --print --no-session --no-tools --no-extensions --no-skills --model localmodels/localmodels-byok 'Verify Windows BYOK recovery.'
+            Write-Output $reply
+            if (($reply -join ' ') -notmatch 'Simulated stub-model.*Verify Windows BYOK recovery' -or (Get-NetTCPConnection -LocalPort 18480 -State Listen).OwningProcess -ne $before) { throw 'Expected Pi reply on the original gateway process' }
+            Write-Output 'Saved Pi profile restored and first Pi request succeeded without restarting the gateway.'
+          } finally {
+            if ($upstream -and !$upstream.HasExited) { $upstream.Kill(); $upstream.WaitForExit() }
+            $env:PYTHONPATH = Join-Path $kit 'modules'
+            & $py -P -s -m localmodels stack down --json
+          }
