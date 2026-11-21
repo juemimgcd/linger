@@ -11,6 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: 18ebf7d120ebc77e4037af54fadc48e5bc99fabe
           persist-credentials: false
       - uses: ./.github/actions/setup
         with:
@@ -52,6 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: 18ebf7d120ebc77e4037af54fadc48e5bc99fabe
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
