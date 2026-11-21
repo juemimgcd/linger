@@ -1,0 +1,55 @@
+name: Build and smoke the Windows BYOK candidate
+on:
+  push:
+    branches: [ci/427-windows-setup]
+permissions:
+  contents: read
+env:
+  DESKTOP_VERSION: 0.1.7-byok.427
+  LINGER_NATIVE_DEPS_URL: https://github.com/simplexai-labs/linger/releases/download/native-deps
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Free space for Desktop packaging on the disposable runner
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v7
+        with:
+          ref: 16fde995dbdb879352d36c118b127602223f64c7
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Build the Windows x64 installer from the PR commit
+        run: |
+          scripts/ci/desktop-release.sh build win32-x64
+          cd .linger-runtime/desktop-release/assets
+          sha256sum "Linger-$DESKTOP_VERSION-windows-x64-setup.exe" | tee windows-setup.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-setup
+          path: |
+            .linger-runtime/desktop-release/assets/*-windows-x64-setup.exe
+            .linger-runtime/desktop-release/assets/windows-setup.sha256
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+  windows-smoke:
+    runs-on: windows-2022
+    needs: build
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 16fde995dbdb879352d36c118b127602223f64c7
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64-setup
+          path: candidate
+      - name: Exercise Setup and the packaged Pi runtime as an ordinary user
+        shell: powershell
+        run: |
+          $setup = "candidate\Linger-$env:DESKTOP_VERSION-windows-x64-setup.exe"
+          $hash = (Get-Content 'candidate\windows-setup.sha256' -Raw).Split(' ')[0]
+          scripts/ci/windows-desktop-smoke.ps1 -Setup $setup -ExpectedSha256 $hash
