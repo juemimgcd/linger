@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 env:
-  DESKTOP_VERSION: 0.1.7-byok.427
+  DESKTOP_VERSION: 0.1.7-byok.427.2
   LINGER_NATIVE_DEPS_URL: https://github.com/simplexai-labs/linger/releases/download/native-deps
 jobs:
   build:
@@ -16,7 +16,7 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v7
         with:
-          ref: 16fde995dbdb879352d36c118b127602223f64c7
+          ref: 18ebf7d120ebc77e4037af54fadc48e5bc99fabe
           persist-credentials: false
       - uses: ./.github/actions/setup
       - name: Build the Windows x64 installer from the PR commit
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 16fde995dbdb879352d36c118b127602223f64c7
+          ref: 18ebf7d120ebc77e4037af54fadc48e5bc99fabe
           persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
