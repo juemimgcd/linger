@@ -26,13 +26,28 @@ jobs:
           name: installer
           path: apps/linger-installer/dist
           retention-days: 3
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: simplexai-labs/linger
+          ref: 77abdcb37f779f9c9d2de89fa245efa88d3f6584
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          go: false
+      - name: Bundle the restore entry from desktop-v0.1.6
+        run: pnpm --filter @linger/linger-installer exec esbuild ../../packages/local-installation/src/local-models.ts --bundle --platform=node --format=esm --target=node26 --outfile=dist/release-restore.mjs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-restore
+          path: apps/linger-installer/dist/release-restore.mjs
+          retention-days: 3
   recovery:
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2025, windows-11-arm]
-    runs-on: ${{ matrix.os }}
+    needs: [build, release]
+    runs-on: windows-2025
     timeout-minutes: 24
     steps:
       - uses: actions/checkout@v7
@@ -46,6 +61,10 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: installer
+          path: ci-installer
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-restore
           path: ci-installer
       - name: Exercise the Windows BYOK startup sequence
         shell: pwsh
@@ -101,6 +120,11 @@ jobs:
             $health = Invoke-RestMethod 'http://127.0.0.1:18480/health' -TimeoutSec 5
             if ($health.status -ne 'ok') { throw 'Gateway health failed' }
           }
+          function Invoke-Pi([string]$text) {
+            $reply = & node (Join-Path $pi $pins.pi.entry) --print --no-session --no-tools --no-extensions --no-skills --model localmodels/localmodels-byok $text
+            Write-Output $reply
+            if (!($reply -join ' ').Contains("[Simulated stub-model] $text")) { throw 'The response did not echo this request through the gateway' }
+          }
           Write-Output "Windows $([Environment]::OSVersion.VersionString), runner $env:RUNNER_ARCH, Node $(node -p 'process.arch')"
           if ((Is-Listening 18090) -or (Is-Listening 18480)) { throw 'Scenario ports already in use' }
           $env:PYTHONPATH = Join-Path $kit 'modules'
@@ -129,10 +153,27 @@ jobs:
             if ((Get-FileHash $models).Hash -ne $modelHash -or (Get-FileHash $settings).Hash -ne $settingsHash) { throw 'Pi profile restoration failed' }
             $upstream = Start-Endpoint
             $env:PI_CODING_AGENT_DIR = $profilePath
-            $reply = & node (Join-Path $pi $pins.pi.entry) --print --no-session --no-tools --no-extensions --no-skills --model localmodels/localmodels-byok 'Verify Windows BYOK recovery.'
-            Write-Output $reply
-            if (($reply -join ' ') -notmatch 'Simulated stub-model.*Verify Windows BYOK recovery' -or (Get-NetTCPConnection -LocalPort 18480 -State Listen).OwningProcess -ne $before) { throw 'Expected Pi reply on the original gateway process' }
+            Invoke-Pi 'Verify Windows BYOK recovery.'
+            if ((Get-NetTCPConnection -LocalPort 18480 -State Listen).OwningProcess -ne $before) { throw 'Gateway changed during profile repair' }
             Write-Output 'Saved Pi profile restored and first Pi request succeeded without restarting the gateway.'
+
+            & $py -P -s -m localmodels stack down --json
+            $upstream.Kill(); $upstream.WaitForExit()
+            if ((Is-Listening 18090) -or (Is-Listening 18480)) { throw 'Release comparison needs both ports offline' }
+            $savedHash = (Get-FileHash $creds).Hash
+            node --input-type=module -e 'import {restoreByokSource} from "./ci-installer/release-restore.mjs"; const failure=await restoreByokSource(process.env.LINGER_HOME,{signal:AbortSignal.timeout(120000),onEvent:e=>console.log(e.message)}); if(failure?.code!=="BYOK_UNREACHABLE") throw new Error(JSON.stringify(failure)); console.log("0.1.6 returned",failure.code);'
+            $upstream = Start-Endpoint
+            if (Is-Listening 18480) { throw 'The issue did not reproduce with the release' }
+            Write-Output '0.1.6: upstream is online and the gateway port is still closed.'
+            $upstream.Kill(); $upstream.WaitForExit()
+            if ((Is-Listening 18090) -or (Get-FileHash $creds).Hash -ne $savedHash) { throw 'The patched comparison must start from the same offline endpoint and saved credentials' }
+            Restore-Gateway
+            if ((Is-Listening 18090) -or (Get-FileHash $creds).Hash -ne $savedHash) { throw 'The candidate must restore the saved gateway offline' }
+            $pidBeforeModel = (Get-NetTCPConnection -LocalPort 18480 -State Listen).OwningProcess
+            $upstream = Start-Endpoint
+            Invoke-Pi 'Compare the patched Windows recovery.'
+            if ((Get-NetTCPConnection -LocalPort 18480 -State Listen).OwningProcess -ne $pidBeforeModel) { throw 'Expected to keep the gateway running' }
+            Write-Output "Patch: gateway PID $pidBeforeModel came up offline, and the first Pi request after endpoint startup succeeded on that PID."
           } finally {
             if ($upstream -and !$upstream.HasExited) { $upstream.Kill(); $upstream.WaitForExit() }
             $env:PYTHONPATH = Join-Path $kit 'modules'
