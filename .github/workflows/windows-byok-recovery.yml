@@ -19,6 +19,7 @@ jobs:
         run: |
           pnpm --filter @linger/linger-installer build
           pnpm --filter @linger/linger-installer exec esbuild ../../packages/local-installation/src/local-models.ts --bundle --platform=node --format=esm --target=node26 --outfile=dist/local-models.mjs
+          pnpm --filter @linger/linger-installer exec esbuild ../../packages/local-installation/src/private-files.ts --bundle --platform=node --format=esm --target=node26 --outfile=dist/private-files.mjs
           cmp packages/local-installation/src/restore-byok.py apps/linger-installer/dist/restore-byok.py
       - uses: actions/upload-artifact@v7
         with:
@@ -52,8 +53,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $ProgressPreference = 'SilentlyContinue'
-          $root = Join-Path $env:RUNNER_TEMP 'byok427'
-          New-Item -Type Directory $root | Out-Null
+          $root = Join-Path $env:LOCALAPPDATA 'Linger-427-CI'
           $env:LINGER_HOME = Join-Path $root 'home'
           $env:LOCALMODELS_STATE = Join-Path $env:LINGER_HOME 'runtime/localmodels/state'
           $env:LOCALMODELS_TOOLS_DIR = Join-Path $root 'tools'
@@ -64,6 +64,7 @@ jobs:
           $env:PYTHONNOUSERSITE = '1'
           $current = (Get-Content apps/desktop/distribution/win32-x64.json -Raw | ConvertFrom-Json).localmodelsTool
           $env:LINGER_LOCALMODELS_TOOL_JSON = $current | ConvertTo-Json -Compress
+          node --input-type=module -e 'import {privateDirectory} from "./ci-installer/private-files.mjs"; import path from "node:path"; await privateDirectory(path.dirname(process.env.LINGER_HOME)); await privateDirectory(process.env.LOCALMODELS_STATE);'
           function Get-PinnedArchive($url, $sha, $name) {
             $archive = Join-Path $root "$name.tgz"
             curl.exe --retry 3 --fail --silent --show-error --location $url --output $archive
