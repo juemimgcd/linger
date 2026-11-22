@@ -1,4 +1,4 @@
-param([string]$Adapter)
+param([string]$Adapter, [string]$Probe = "qa470/fingerprint.py")
 $ErrorActionPreference = 'Stop'
 $os = Get-CimInstance Win32_OperatingSystem
 Write-Host "OS=$($os.Caption) build=$($os.BuildNumber) host=$([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
@@ -13,5 +13,5 @@ tar.exe -xzf $archive -C $dir
 if ($LASTEXITCODE -ne 0) { throw 'Kit extraction failed' }
 $env:PYTHONPATH = Join-Path $dir 'package/modules'
 $env:PYTHONDONTWRITEBYTECODE = '1'
-& "$dir/package/python/python.exe" -P -s qa470/fingerprint.py $Adapter
+& "$dir/package/python/python.exe" -P -s $Probe $Adapter
 exit $LASTEXITCODE

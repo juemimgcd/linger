@@ -1,0 +1,45 @@
+name: Windows 11 file handle and ordinary-user package verification
+on:
+  push:
+    branches: [qa/470-win11-controls]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  handles:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - shell: pwsh
+        run: ./qa470/binding.ps1 packages/local-installation/src/windows-stack-binding.py qa470/handle.py
+  ordinary-user-setup:
+    runs-on: windows-11-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Await the artifact from the exact PR build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for ($i=0; $i -lt 50; $i++) {
+            $artifact = gh api repos/juemimgcd/linger/actions/runs/44979385245/artifacts --jq '.artifacts[] | select(.name=="pr470-windows-x64") | .id'
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect build artifacts' }
+            if ($artifact) { Write-Host "Candidate artifact $artifact"; exit 0 }
+            $status = gh api repos/juemimgcd/linger/actions/jobs/137076318746 --jq '.conclusion'
+            if ($status -and $status -ne 'success') { throw "Build ended with $status" }
+            Start-Sleep -Seconds 20
+          }
+          throw 'Build artifact did not become available'
+      - uses: actions/download-artifact@v8
+        with:
+          name: pr470-windows-x64
+          path: candidate
+          run-id: 44979385245
+          github-token: ${{ github.token }}
+      - shell: pwsh
+        run: ./qa470/ordinary-user.ps1
