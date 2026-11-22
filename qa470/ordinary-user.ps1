@@ -3,6 +3,16 @@ $ErrorActionPreference = 'Stop'
 if ($Worker) {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   if ($id.User.Value -ne $Worker -or ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'An ordinary user is required' }
+  # Alternate credentials load the profile hive, but Start-Process inherits
+  # the orchestrator's environment. Resolve Windows known folders as that user.
+  $env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
+  $env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+  $env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+  $env:TEMP = Join-Path $env:LOCALAPPDATA Temp
+  $env:TMP = $env:TEMP
+  $env:USERNAME = $id.Name.Split('\')[-1]
+  if ((Split-Path $env:USERPROFILE -Leaf) -notlike "$($env:USERNAME)*" -or !$env:LOCALAPPDATA.StartsWith("$env:USERPROFILE\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Known folders do not belong to the ordinary user' }
+  [IO.Directory]::CreateDirectory($env:TEMP) | Out-Null
   $app = Join-Path $env:LOCALAPPDATA 'Programs/Linger/Linger.exe'
   if (Test-Path $app) { throw 'An empty profile is required' }
   $setup = Join-Path $Scratch Setup.exe
