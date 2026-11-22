@@ -1,0 +1,92 @@
+name: Verify PR 470 on Windows 11
+on:
+  push:
+    branches: [qa/470-win11-install]
+permissions:
+  contents: read
+env:
+  DESKTOP_VERSION: 0.1.7-qa.470
+  LINGER_NATIVE_DEPS_URL: https://github.com/simplexai-labs/linger/releases/download/native-deps
+jobs:
+  binding:
+    runs-on: windows-11-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compare released and PR binding on real Windows files with the pinned x64 Python
+        shell: pwsh
+        run: ./qa470/binding.ps1 packages/local-installation/src/windows-stack-binding.py
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: cad598b356a41c801c5f41471c12813ec45b2ac6
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Build the x64 Setup and portable from the exact PR commit
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          scripts/ci/desktop-release.sh build win32-x64
+          cd .linger-runtime/desktop-release/assets
+          sha256sum *.exe *.zip > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pr470-windows-x64
+          path: .linger-runtime/desktop-release/assets/
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+  install:
+    needs: package
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: pr470-windows-x64
+          path: candidate
+      - name: Verify both artifact hashes and install x64 Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "OS=$($os.Caption) build=$($os.BuildNumber) host=$([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+          if ($os.Caption -notmatch 'Windows 11' -or $os.ProductType -ne 1) { throw 'Windows 11 client required' }
+          foreach($line in Get-Content candidate/SHA256SUMS) {
+            $hash,$name = $line -split '\s+',2
+            if ((Get-FileHash (Join-Path candidate $name)).Hash -ne $hash) { throw "Digest mismatch: $name" }
+          }
+          $setup = (Get-ChildItem candidate/*-setup.exe).FullName
+          $p = Start-Process $setup -ArgumentList '/S' -PassThru
+          if (!$p.WaitForExit(240000) -or $p.ExitCode -ne 0) { throw 'Silent setup failed' }
+          $app = Join-Path $env:LOCALAPPDATA 'Programs/Linger'
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          & "$app/Linger.exe" -e "console.log('Installed Electron:',process.platform,process.arch,process.versions.electron);if(process.arch!=='x64')process.exit(1)" | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Installed app runtime failed' }
+          $zip = (Get-ChildItem candidate/*-portable.zip).FullName
+          $portable = Join-Path $env:RUNNER_TEMP 'pr470portable'
+          New-Item -ItemType Directory $portable | Out-Null
+          tar.exe -xf $zip -C $portable
+          if ($LASTEXITCODE -ne 0) { throw 'Portable extraction failed' }
+          $exe = Get-ChildItem $portable -Filter Linger.exe -Recurse | Select-Object -First 1
+          if (!$exe) { throw 'Portable desktop executable missing' }
+          "PORTABLE_DIR=$($exe.DirectoryName)" >> $env:GITHUB_ENV
+      - name: Exercise the adapter that actually shipped in portable
+        shell: pwsh
+        run: ./qa470/binding.ps1 "$env:PORTABLE_DIR/resources/app/dist/installer/windows-stack-binding.py"
+      - name: Start portable and request local models through the setup window
+        if: "!cancelled() && env.PORTABLE_DIR != ''"
+        shell: pwsh
+        run: |
+          $env:LINGER_HOME = Join-Path $env:LOCALAPPDATA 'Linger470Home'
+          $env:LINGER_DESKTOP_USER_DATA = Join-Path $env:LOCALAPPDATA 'Linger470Profile'
+          & "$env:PORTABLE_DIR/resources/runtime/bin/node.exe" qa470/desktop.mjs "$env:PORTABLE_DIR/Linger.exe"
+          exit $LASTEXITCODE
