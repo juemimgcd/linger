@@ -5,13 +5,18 @@ if ($Worker) {
   if ($id.User.Value -ne $Worker -or ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'An ordinary user is required' }
   # Alternate credentials load the profile hive, but Start-Process inherits
   # the orchestrator's environment. Resolve Windows known folders as that user.
-  $env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
-  $env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
-  $env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+  $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Worker"
+  $env:USERPROFILE = Get-ItemPropertyValue -LiteralPath $profileKey -Name ProfileImagePath
+  $env:HOMEDRIVE = $env:USERPROFILE.Substring(0,2)
+  $env:HOMEPATH = $env:USERPROFILE.Substring(2)
+  $env:USERNAME = $id.Name.Split('\')[-1]
+  $folders = "Registry::HKEY_USERS\$Worker\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+  $env:LOCALAPPDATA = [Environment]::ExpandEnvironmentVariables((Get-ItemPropertyValue -LiteralPath $folders -Name 'Local AppData'))
+  $env:APPDATA = [Environment]::ExpandEnvironmentVariables((Get-ItemPropertyValue -LiteralPath $folders -Name AppData))
   $env:TEMP = Join-Path $env:LOCALAPPDATA Temp
   $env:TMP = $env:TEMP
-  $env:USERNAME = $id.Name.Split('\')[-1]
-  if ((Split-Path $env:USERPROFILE -Leaf) -notlike "$($env:USERNAME)*" -or !$env:LOCALAPPDATA.StartsWith("$env:USERPROFILE\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Known folders do not belong to the ordinary user' }
+  Write-Host "Fresh profile: $env:USERPROFILE; local data: $env:LOCALAPPDATA; user: $env:USERNAME"
+  if (!$env:LOCALAPPDATA.StartsWith("$env:USERPROFILE\", [StringComparison]::OrdinalIgnoreCase)) { throw 'User profile and local data differ' }
   [IO.Directory]::CreateDirectory($env:TEMP) | Out-Null
   $app = Join-Path $env:LOCALAPPDATA 'Programs/Linger/Linger.exe'
   if (Test-Path $app) { throw 'An empty profile is required' }
