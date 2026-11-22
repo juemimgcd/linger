@@ -33,7 +33,7 @@ try {
   $credential = [pscredential]::new("$env:COMPUTERNAME\$name",$password)
   $stdout = Join-Path $stage stdout.log
   $stderr = Join-Path $stage stderr.log
-  $p = Start-Process "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -Credential $credential -LoadUserProfile -WorkingDirectory $stage -ArgumentList $argsList -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+  $p = Start-Process (Join-Path $PSHOME pwsh.exe) -Credential $credential -LoadUserProfile -WorkingDirectory $stage -ArgumentList $argsList -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
   $null = $p.Handle
   $done = $p.WaitForExit(1140000)
   Get-Content $stdout,$stderr -Tail 40
